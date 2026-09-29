@@ -8,7 +8,7 @@ import torch.cuda
 import torch.cuda.nccl as nccl
 import torch.distributed as c10d
 import torch.distributed._symmetric_memory as symm_mem
-from torch.testing._internal.common_cuda import TEST_CUDA, TEST_MULTIGPU
+from torch.testing._internal.common_cuda import SM70OrLater, TEST_CUDA, TEST_MULTIGPU
 from torch.testing._internal.common_device_type import (
     dtypes,
     instantiate_device_type_tests,
@@ -808,6 +808,9 @@ class NCCLSymmetricMemoryTest(MultiProcContinuousTest):
     @skip_but_pass_in_sandcastle_if(TEST_WITH_ROCM, "Skip NCCL tests for ROCm")
     @skip_but_pass_in_sandcastle_if(IS_WINDOWS, "NCCL doesn't support Windows")
     @requires_nccl_version((2, 29), "nccl_all_gather_offset requires nccl 2.29")
+    @skip_but_pass_in_sandcastle_if(
+        not SM70OrLater, "nccl_all_gather_offset requires sm70 or later"
+    )
     @skip_if_lt_x_gpu(2)
     # Shard sizes are multiples of 8 so every slice stays 16-byte aligned for
     # both float (4B) and bfloat16 (2B), as the kernel requires.  `out` is a

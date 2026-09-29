@@ -41,8 +41,14 @@ using namespace c10d::symmetric_memory;
 
 // The push kernel uses the symmetric-memory device API (ncclGetLsaPointer, LSA
 // barriers); the multimem kernel additionally needs the device reduce-copy API
-// (NCCL_DEVICE_HAS_REDUCE_COPY, NCCL >= 2.29.7).
-#ifdef NCCL_HAS_SYMMEM_DEVICE_SUPPORT
+// (NCCL_DEVICE_HAS_REDUCE_COPY, NCCL >= 2.29.7). Creating the device
+// communicator requires the host-side devcomm API added in NCCL 2.29.0.
+#if defined(NCCL_HAS_SYMMEM_DEVICE_SUPPORT) && \
+    NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#define C10D_NCCL_ALL_GATHER_OFFSET_SUPPORTED_ARCH
+#endif
 
 // Threads per CTA; sized to copy medium parameter shards efficiently.
 constexpr int AG_THREADS_PER_CTA = 256;
@@ -70,6 +76,7 @@ struct AllGatherOffsetSchedule {
 // The acquire sync orders against any prior use of `out`; the trailing
 // release+acquire guarantees that, on return, every rank has finished its
 // writes (release) and observes all peers' writes to its output (acquire).
+#ifdef C10D_NCCL_ALL_GATHER_OFFSET_SUPPORTED_ARCH
 __global__ void all_gather_offset_push_kernel(
     ncclWindow_t out_window,
     size_t out_window_base_offset,
@@ -111,8 +118,9 @@ __global__ void all_gather_offset_push_kernel(
   // (acquire) in a single barrier round before returning.
   bar.sync(coop, cuda::memory_order_acq_rel);
 }
+#endif // C10D_NCCL_ALL_GATHER_OFFSET_SUPPORTED_ARCH
 
-#endif // NCCL_HAS_SYMMEM_DEVICE_SUPPORT
+#endif // NCCL_HAS_SYMMEM_DEVICE_SUPPORT && NCCL >= 2.29.0
 
 #ifdef NCCL_DEVICE_HAS_REDUCE_COPY
 
@@ -122,6 +130,7 @@ __global__ void all_gather_offset_push_kernel(
 // output, so each rank only writes its own N shards.  Data is treated as 32-bit
 // words (every slice is 16-byte aligned, hence a multiple of 4 bytes), keeping
 // the kernel dtype-agnostic.
+#ifdef C10D_NCCL_ALL_GATHER_OFFSET_SUPPORTED_ARCH
 __global__ void all_gather_offset_mm_kernel(
     ncclWindow_t out_window,
     size_t out_window_base_offset,
@@ -154,6 +163,7 @@ __global__ void all_gather_offset_mm_kernel(
   // (acquire) in a single barrier round before returning.
   bar.sync(coop, cuda::memory_order_acq_rel);
 }
+#endif // C10D_NCCL_ALL_GATHER_OFFSET_SUPPORTED_ARCH
 
 #endif // NCCL_DEVICE_HAS_REDUCE_COPY
 
@@ -165,7 +175,8 @@ void nccl_all_gather_offset(
     const std::string& group_name,
     at::IntArrayRef split_sizes,
     std::optional<at::IntArrayRef> split_offsets) {
-#ifdef NCCL_HAS_SYMMEM_DEVICE_SUPPORT
+#if defined(NCCL_HAS_SYMMEM_DEVICE_SUPPORT) && \
+    NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 0)
   TORCH_CHECK(input.dim() == 1, "nccl_all_gather_offset: input must be 1-D");
   TORCH_CHECK(out.dim() == 1, "nccl_all_gather_offset: out must be 1-D");
   TORCH_CHECK(
@@ -190,6 +201,9 @@ void nccl_all_gather_offset(
       " (max ", AG_MAX_PARAMS, "); split the call");
 
   c10::cuda::CUDAGuard guard(input.device());
+  TORCH_CHECK(
+      at::cuda::getCurrentDeviceProperties()->major >= 7,
+      "nccl_all_gather_offset requires CUDA compute capability 7.0 or later");
   auto stream = at::cuda::getCurrentCUDAStream();
   auto device = input.device();
 
@@ -318,6 +332,7 @@ void nccl_all_gather_offset(
 #ifdef NCCL_DEVICE_HAS_REDUCE_COPY
   if (use_multimem) {
     const int n_ctas = std::min(n_params, AG_MAX_CTAS);
+#ifdef C10D_NCCL_ALL_GATHER_OFFSET_SUPPORTED_ARCH
     all_gather_offset_mm_kernel<<<n_ctas, AG_THREADS_PER_CTA, 0, stream>>>(
         out_window,
         out_window_base_offset,
@@ -330,12 +345,14 @@ void nccl_all_gather_offset(
         devcomm.lsaMultimem,
         devcomm);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif // C10D_NCCL_ALL_GATHER_OFFSET_SUPPORTED_ARCH
     return;
   }
 #endif // NCCL_DEVICE_HAS_REDUCE_COPY
 
   const int total_pairs = n_params * world_size;
   const int n_ctas = std::min(total_pairs, AG_MAX_CTAS);
+#ifdef C10D_NCCL_ALL_GATHER_OFFSET_SUPPORTED_ARCH
   all_gather_offset_push_kernel<<<n_ctas, AG_THREADS_PER_CTA, 0, stream>>>(
       out_window,
       out_window_base_offset,
@@ -347,11 +364,13 @@ void nccl_all_gather_offset(
       elem_size,
       devcomm);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif // C10D_NCCL_ALL_GATHER_OFFSET_SUPPORTED_ARCH
+#undef C10D_NCCL_ALL_GATHER_OFFSET_SUPPORTED_ARCH
 #else
   TORCH_CHECK(
       false,
-      "nccl_all_gather_offset requires NCCL >= 2.28.4 with symmetric memory device API support");
-#endif // NCCL_HAS_SYMMEM_DEVICE_SUPPORT
+      "nccl_all_gather_offset requires NCCL >= 2.29.0 with symmetric memory device API support");
+#endif // NCCL_HAS_SYMMEM_DEVICE_SUPPORT && NCCL >= 2.29.0
 }
 
 } // namespace c10d::nccl_extension
